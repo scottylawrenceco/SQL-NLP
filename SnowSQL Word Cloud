@@ -1,0 +1,100 @@
+WITH
+
+CTE_WORDS as (
+/*  =====================
+Using a lateral split to table function will be very similar to the "tokenize" functions found in Python / R. 
+This function will create a split at the delimiter, in this case a space and each split is a new row. The regex replaces punctation.
+========================= */
+	SELECT
+				SURVEY_ID
+				, "NPS_SCORE"
+				, replace(lower(value),'[\")(\.,#&!?\\\'-0;:]','') as "WORD"
+				, index 
+		FROM DATABASE.SCHEMA.NPS_CUSTOMER_SURVEY
+					, lateral split_to_table(DATABASE.SCHEMA.NPS_CUSTOMER_SURVEY.NPS_THRIVE_WHY_NOCDP, ' ')
+)
+, CTE_STOPWORDS as (
+/*  =====================
+I'm removing stop words here. There is a CSV in this repository that is the stopword set from Python's nltk package.
+========================= */
+
+SELECT
+	*
+FROM
+	CTE_WORDS as W
+	LEFT JOIN STOPWORDS_CSV S on S.STOPWORD = W.WORD
+WHERE
+  S.STOPWORD is null 
+)
+, CTE_TF_IDF as (
+/*  =====================
+Here I am calcuating the term frequency inverse document frequency (TD-IDF) to identify words that occur often within 
+specific surveys but not as often across all documents. This is a much more useful method to identify "top words" beyond just counts.
+========================= */
+
+SELECT
+    *
+    ,TERM_FREQUENCY * (ln(((1+"TOTAL_DOCS") / (1+ "DOC_FREQUENCY_WORD"))+1)) as "TF_IDF"
+FROM
+    (
+    SELECT
+      *
+      ,COUNT(*) OVER(PARTITION BY RESPONSE_ID, WORD) as "TERM_FREQUENCY"
+      ,COUNT(*) OVER(PARTITION BY RESPONSE_ID) AS "DOC_WORD_COUNTS"
+      ,COUNT(DISTINCT RESPONSE_ID) OVER(PARTITION BY NULL) as "TOTAL_DOCS"
+      ,COUNT(DISTINCT RESPONSE_ID) OVER(PARTITION BY WORD) AS "DOC_FREQUENCY_WORD"
+
+    FROM CTE_WORDS as W
+    )
+)
+, CTE_WORD_RANKS as (
+/*  ===================== 
+Here I am calculating the word rank as part of Zipf's Law. Zifp's law states that the percentage of frequency 
+of a word in a corpus	will be roughly equal to 1 / (Rank). This can also help identify outliers.
+========================= */
+
+SELECT 
+    COUNT(*) as "WORD_COUNT"
+    ,AVG(NPS_SCORE) as "SENTIMENT"
+    ,TF_IDF
+    ,ROW_NUMBER() OVER(ORDER BY COUNT(*) DESC)-1  as "Zipf_rank"
+    ,"WORD"
+FROM
+    CTE_TF_IDF
+WHERE
+    "WORD" not in ('')
+GROUP by
+    TF_IDF
+    ,"WORD"
+)
+,CTE_INTENSITY_SCORE as (
+/*  =====================	
+Here I want to create a contextual sentiment lexicon based on the Net Promoter Score from the customer surveys. 
+Net Promoter Score is a specific calculation which is not being applied here, but the score (0 - 10) itself can 
+be used to quantify the sentiment about any specific word. I want to get the average Score, but I also want to quantify it's intensity.
+========================= */					
+
+SELECT
+    "WORD"
+    ,"WORD_COUNT"
+    ,"SENTIMENT"
+    ,TF_IDF
+    ,CASE WHEN SENTIMENT > 5 THEN SENTIMENT - 5
+          WHEN SENTIMENT < 5 THEN ABS(5-SENTIMENT)
+          ELSE 0 END as "INTENSITY"
+    ,CASE WHEN SENTIMENT > 6 THEN 'Positive'
+          WHEN SENTIMENT < 4 THEN 'Negative'
+          ELSE 'Neutral' END as "SENTIMENT_TYPE"
+    ,"WORD_COUNT" / (SELECT "WORD_COUNT" FROM CTE_WORD_RANKS WHERE "Zipf_rank" = 0)  as "zipf_model"
+    ,CASE WHEN "Zipf_rank" > 0 THEN 1/"Zipf_rank" ELSE 0 END as "Zipf_rank"
+FROM
+    CTE_WORD_RANKS
+)
+
+SELECT
+    *
+FROM
+    CTE_INTENSITY_SCORE
+ORDER BY
+    "SENTIMENT_TYPE", (INTENSITY * TF_IDF * "zipf_model" ) DESC
+    
